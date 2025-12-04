@@ -1,0 +1,12 @@
+apiVersion: model.example.com/v1alpha1
+kind: ModelServe
+metadata:
+  labels:
+    app.kubernetes.io/name: modelserve
+    app.kubernetes.io/instance: modelserve-sample
+    app.kubernetes.io/part-of: operator
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/created-by: operator
+  name: modelserve-sample
+spec:
+  # TODO(user): Add fields here

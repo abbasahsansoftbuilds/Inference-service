@@ -1,0 +1,70 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: monitor-script
+  namespace: default
+data:
+  monitor.py: |
+    import os
+    import time
+    import psycopg2
+    import psutil
+
+    UUID = os.environ.get("SERVER_UUID")
+    MODEL_NAME = os.environ.get("MODEL_NAME", "unknown")
+    DB_HOST = "postgres"
+    DB_NAME = "inference_db"
+    DB_USER = "admin"
+    DB_PASS = "password"
+
+    print(f"Starting monitor for UUID: {UUID}, Model: {MODEL_NAME}")
+
+    def get_conn():
+        return psycopg2.connect(host=DB_HOST, database=DB_NAME, user=DB_USER, password=DB_PASS)
+
+    # Initial insert
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """INSERT INTO server_status (uuid, model_name, status, memory_usage_mb, endpoint) 
+               VALUES (%s, %s, %s, %s, %s) 
+               ON CONFLICT (uuid) DO UPDATE SET status=EXCLUDED.status, updated_at=CURRENT_TIMESTAMP""",
+            (UUID, MODEL_NAME, 'Starting', 0, f'/{UUID}')
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"Initial insert error: {e}")
+
+    while True:
+        try:
+            conn = get_conn()
+            cur = conn.cursor()
+            
+            # Find llama-server process
+            # Since we share process namespace, we can see all processes.
+            mem_usage = 0
+            found = False
+            for proc in psutil.process_iter(['pid', 'name', 'memory_info', 'cmdline']):
+                # Check name or cmdline
+                if 'llama-server' in proc.info['name'] or (proc.info['cmdline'] and 'llama-server' in proc.info['cmdline'][0]):
+                    mem_usage = proc.info['memory_info'].rss / 1024 / 1024 # MB
+                    found = True
+                    break
+            
+            status = 'Running' if found else 'Starting' # Or Error if it takes too long
+            
+            cur.execute(
+                "UPDATE server_status SET status=%s, memory_usage_mb=%s, updated_at=CURRENT_TIMESTAMP WHERE uuid=%s",
+                (status, int(mem_usage), UUID)
+            )
+            conn.commit()
+            cur.close()
+            conn.close()
+            
+        except Exception as e:
+            print(f"Error: {e}")
+        
+        time.sleep(5)

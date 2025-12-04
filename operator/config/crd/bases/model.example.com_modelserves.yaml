@@ -1,0 +1,68 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.12.0
+  name: modelserves.model.example.com
+spec:
+  group: model.example.com
+  names:
+    kind: ModelServe
+    listKind: ModelServeList
+    plural: modelserves
+    singular: modelserve
+  scope: Namespaced
+  versions:
+  - name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        type: object
+        description: ModelServe is the Schema for the modelserves API
+        properties:
+          apiVersion:
+            description: 'APIVersion defines the versioned schema of this representation
+              of an object. Servers should convert recognized schemas to the latest
+              internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources'
+            type: string
+          kind:
+            description: 'Kind is a string value representing the REST resource this
+              object represents. Servers may infer this from the endpoint the client
+              submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds'
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: ModelServeSpec defines the desired state of ModelServe
+            properties:
+              image:
+                description: Image is the container image to use for serving (optional)
+                type: string
+              modelName:
+                description: ModelName is the name of the model to serve
+                type: string
+              modelUrl:
+                description: ModelURL is the URL or local path to the model file
+                type: string
+              replicas:
+                description: Replicas is the number of replicas to run (optional, default
+                  1)
+                format: int32
+                type: integer
+            required:
+            - modelName
+            - modelUrl
+            type: object
+          status:
+            description: ModelServeStatus defines the observed state of ModelServe
+            properties:
+              availableReplicas:
+                description: AvailableReplicas is the number of available replicas
+                format: int32
+                type: integer
+            required:
+            - availableReplicas
+            type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

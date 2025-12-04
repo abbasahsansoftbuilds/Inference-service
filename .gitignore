@@ -1,0 +1,102 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+venv/
+ENV/
+env/
+.venv
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Go
+vendor/
+go.sum
+tools/gopath/
+tools/go/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.iml
+.*.swp
+
+# Kubernetes
+kubeconfig
+kubeconfig.yaml
+*.kubeconfig
+
+# Process PID files
+*.pid
+fastapi_service/fastapi.pid
+contract_service/contract.pid
+operator/operator.pid
+
+# Model files (too large)
+Model_Catalog/*.gguf
+!Model_Catalog/.gitkeep
+
+# Build artifacts
+operator/bin/
+operator/dist/
+
+# Local environment files
+.env
+.env.local
+*.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+*.cache
+
+# Kubernetes manifests - local overrides
+config/local/
+
+# Docker
+.dockerignore
+
+# Testing
+coverage/
+.coverage
+htmlcov/
+.pytest_cache/
+test-results/
+
+# Node modules (if any)
+node_modules/
+package-lock.json
+
+# Tool binaries (already in git)
+tools/bin/*
+!tools/bin/kubebuilder
+!tools/bin/operator-sdk

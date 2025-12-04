@@ -1,0 +1,42 @@
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: model-qwen-gguf-stripprefix
+  namespace: default
+spec:
+  stripPrefix:
+    prefixes:
+      - /model-qwen-gguf
+
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: model-danube-gguf-stripprefix
+  namespace: default
+spec:
+  stripPrefix:
+    prefixes:
+      - /model-danube-gguf
+
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: model-smollm2-gguf-stripprefix
+  namespace: default
+spec:
+  stripPrefix:
+    prefixes:
+      - /model-smollm2-gguf
+
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: model-bloomz-gguf-stripprefix
+  namespace: default
+spec:
+  stripPrefix:
+    prefixes:
+      - /model-bloomz-gguf
