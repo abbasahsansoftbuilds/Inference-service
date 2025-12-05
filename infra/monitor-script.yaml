@@ -1,0 +1,136 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: monitor-script
+  namespace: default
+data:
+  monitor.py: |
+    #!/usr/bin/env python3
+    """
+    Monitor sidecar for llama.cpp server.
+    Reports memory usage, CPU usage, and health status to PostgreSQL.
+    """
+    import os
+    import sys
+    import time
+    import psutil
+    import requests
+    import psycopg2
+    from datetime import datetime
+    
+    # Environment variables
+    SERVER_UUID = os.environ.get("SERVER_UUID", "unknown")
+    MODEL_UUID = os.environ.get("MODEL_UUID", "unknown")
+    MODEL_NAME = os.environ.get("MODEL_NAME", "unknown")
+    DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://admin:password@postgres:5432/inference_db")
+    LLAMA_SERVER_URL = "http://localhost:8080"
+    POLL_INTERVAL = 10  # seconds
+    
+    def get_db_connection():
+        """Create database connection."""
+        return psycopg2.connect(DATABASE_URL)
+    
+    def find_llama_process():
+        """Find the llama-server process."""
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                cmdline = proc.info.get('cmdline', [])
+                if cmdline and any('llama' in str(arg).lower() for arg in cmdline):
+                    return proc
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        return None
+    
+    def get_resource_usage(proc):
+        """Get memory and CPU usage for the llama process."""
+        if not proc:
+            return 0, 0.0
+        try:
+            mem_info = proc.memory_info()
+            memory_mb = mem_info.rss / (1024 * 1024)
+            cpu_percent = proc.cpu_percent(interval=1)
+            return int(memory_mb), cpu_percent
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            return 0, 0.0
+    
+    def check_health():
+        """Check if llama server is healthy."""
+        try:
+            response = requests.get(f"{LLAMA_SERVER_URL}/health", timeout=5)
+            return response.status_code == 200
+        except requests.exceptions.RequestException:
+            return False
+    
+    def update_status(conn, status, memory_mb, cpu_percent, pod_name=None):
+        """Update server status in database."""
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE server_records 
+                SET status = %s,
+                    memory_max_mb = GREATEST(memory_max_mb, %s),
+                    cpu_usage_percent = %s,
+                    pod_name = COALESCE(%s, pod_name)
+                WHERE uuid = %s
+            """, (status, memory_mb, cpu_percent, pod_name, SERVER_UUID))
+            conn.commit()
+            cursor.close()
+        except Exception as e:
+            print(f"Error updating status: {e}", file=sys.stderr)
+            conn.rollback()
+    
+    def main():
+        """Main monitoring loop."""
+        print(f"Starting monitor for server {SERVER_UUID}, model {MODEL_NAME}")
+        
+        # Get pod name from hostname
+        pod_name = os.environ.get("HOSTNAME", "unknown")
+        
+        # Wait for database to be ready
+        conn = None
+        for i in range(30):
+            try:
+                conn = get_db_connection()
+                print("Connected to database")
+                break
+            except Exception as e:
+                print(f"Waiting for database... ({i+1}/30)")
+                time.sleep(2)
+        
+        if not conn:
+            print("Failed to connect to database", file=sys.stderr)
+            sys.exit(1)
+        
+        # Wait for llama server to start
+        print("Waiting for llama server to start...")
+        for i in range(60):
+            if check_health():
+                print("Llama server is healthy")
+                break
+            time.sleep(2)
+        
+        # Main loop
+        while True:
+            try:
+                proc = find_llama_process()
+                is_healthy = check_health()
+                memory_mb, cpu_percent = get_resource_usage(proc)
+                
+                status = "running" if is_healthy else "unhealthy"
+                
+                update_status(conn, status, memory_mb, cpu_percent, pod_name)
+                
+                print(f"[{datetime.now().isoformat()}] Status: {status}, Memory: {memory_mb}MB, CPU: {cpu_percent}%")
+                
+            except Exception as e:
+                print(f"Error in monitoring loop: {e}", file=sys.stderr)
+                # Try to reconnect to database
+                try:
+                    conn = get_db_connection()
+                except:
+                    pass
+            
+            time.sleep(POLL_INTERVAL)
+    
+    if __name__ == "__main__":
+        main()

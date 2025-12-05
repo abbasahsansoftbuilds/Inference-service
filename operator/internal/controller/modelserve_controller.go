@@ -2,11 +2,16 @@ package controller
 
 import (
 	"context"
+	"fmt"
+	"os"
+	"strings"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -24,12 +29,23 @@ type ModelServeReconciler struct {
 	Scheme *runtime.Scheme
 }
 
+// Environment variable defaults
+func getEnvOrDefault(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
 //+kubebuilder:rbac:groups=model.example.com,resources=modelserves,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=model.example.com,resources=modelserves/status,verbs=get;update;patch
 //+kubebuilder:rbac:groups=model.example.com,resources=modelserves/finalizers,verbs=update
 //+kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch
+//+kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
 //+kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=traefik.containo.us,resources=middlewares,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -46,6 +62,22 @@ func (r *ModelServeReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, err
 	}
 
+	// Update status to Pending if not set
+	if modelServe.Status.Phase == "" {
+		modelServe.Status.Phase = "Pending"
+		modelServe.Status.Message = "Initializing model server"
+		if err := r.Status().Update(ctx, modelServe); err != nil {
+			l.Error(err, "Failed to update initial status")
+			return ctrl.Result{}, err
+		}
+	}
+
+	// Create StripPrefix middleware for Traefik
+	if err := r.createStripPrefixMiddleware(ctx, modelServe); err != nil {
+		l.Error(err, "Failed to create StripPrefix middleware")
+		return ctrl.Result{}, err
+	}
+
 	// Define Deployment
 	dep := r.deploymentForModelServe(modelServe)
 
@@ -54,9 +86,20 @@ func (r *ModelServeReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	err = r.Get(ctx, types.NamespacedName{Name: dep.Name, Namespace: dep.Namespace}, found)
 	if err != nil && errors.IsNotFound(err) {
 		l.Info("Creating a new Deployment", "Deployment.Namespace", dep.Namespace, "Deployment.Name", dep.Name)
+		
+		// Update status to Downloading
+		modelServe.Status.Phase = "Downloading"
+		modelServe.Status.Message = "Downloading model from MinIO"
+		if err := r.Status().Update(ctx, modelServe); err != nil {
+			l.Error(err, "Failed to update status to Downloading")
+		}
+		
 		err = r.Create(ctx, dep)
 		if err != nil {
 			l.Error(err, "Failed to create new Deployment", "Deployment.Namespace", dep.Namespace, "Deployment.Name", dep.Name)
+			modelServe.Status.Phase = "Failed"
+			modelServe.Status.Message = fmt.Sprintf("Failed to create deployment: %v", err)
+			r.Status().Update(ctx, modelServe)
 			return ctrl.Result{}, err
 		}
 		// Deployment created successfully - return and requeue
@@ -104,9 +147,61 @@ func (r *ModelServeReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, err
 	}
 
-	// Update Status
+	// Update Status based on deployment state
+	needsStatusUpdate := false
+	
 	if found.Status.AvailableReplicas != modelServe.Status.AvailableReplicas {
 		modelServe.Status.AvailableReplicas = found.Status.AvailableReplicas
+		needsStatusUpdate = true
+	}
+
+	// Update service name
+	if modelServe.Status.ServiceName != svc.Name {
+		modelServe.Status.ServiceName = svc.Name
+		needsStatusUpdate = true
+	}
+
+	// Update gateway URL
+	gatewayURL := fmt.Sprintf("http://localhost/%s", modelServe.Name)
+	if modelServe.Status.GatewayURL != gatewayURL {
+		modelServe.Status.GatewayURL = gatewayURL
+		needsStatusUpdate = true
+	}
+
+	// Update phase based on replicas
+	if found.Status.AvailableReplicas > 0 {
+		if modelServe.Status.Phase != "Running" {
+			modelServe.Status.Phase = "Running"
+			modelServe.Status.Message = "Model server is running"
+			now := metav1.NewTime(time.Now())
+			modelServe.Status.StartedAt = &now
+			needsStatusUpdate = true
+		}
+		
+		// Try to get pod name
+		podList := &corev1.PodList{}
+		listOpts := []client.ListOption{
+			client.InNamespace(modelServe.Namespace),
+			client.MatchingLabels(labelsForModelServe(modelServe.Name)),
+		}
+		if err := r.List(ctx, podList, listOpts...); err == nil && len(podList.Items) > 0 {
+			for _, pod := range podList.Items {
+				if pod.Status.Phase == corev1.PodRunning {
+					if modelServe.Status.PodName != pod.Name {
+						modelServe.Status.PodName = pod.Name
+						needsStatusUpdate = true
+					}
+					break
+				}
+			}
+		}
+	} else if modelServe.Status.Phase != "Downloading" && modelServe.Status.Phase != "Failed" {
+		modelServe.Status.Phase = "Pending"
+		modelServe.Status.Message = "Waiting for pod to be ready"
+		needsStatusUpdate = true
+	}
+
+	if needsStatusUpdate {
 		err = r.Status().Update(ctx, modelServe)
 		if err != nil {
 			l.Error(err, "Failed to update ModelServe status")
@@ -117,7 +212,39 @@ func (r *ModelServeReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	return ctrl.Result{}, nil
 }
 
-// deploymentForModelServe returns a modelServe Deployment object
+// createStripPrefixMiddleware creates a Traefik StripPrefix middleware for the model
+func (r *ModelServeReconciler) createStripPrefixMiddleware(ctx context.Context, m *modelv1alpha1.ModelServe) error {
+	// Create StripPrefix middleware using unstructured object since we may not have Traefik CRDs imported
+	middleware := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      m.Name + "-stripprefix",
+			Namespace: m.Namespace,
+			Labels:    labelsForModelServe(m.Name),
+		},
+		Data: map[string]string{
+			"middleware.yaml": fmt.Sprintf(`
+apiVersion: traefik.containo.us/v1alpha1
+kind: Middleware
+metadata:
+  name: %s-stripprefix
+  namespace: %s
+spec:
+  stripPrefix:
+    prefixes:
+      - /%s
+`, m.Name, m.Namespace, m.Name),
+		},
+	}
+
+	found := &corev1.ConfigMap{}
+	err := r.Get(ctx, types.NamespacedName{Name: middleware.Name, Namespace: middleware.Namespace}, found)
+	if err != nil && errors.IsNotFound(err) {
+		return r.Create(ctx, middleware)
+	}
+	return err
+}
+
+// deploymentForModelServe returns a modelServe Deployment object with MinIO init container
 func (r *ModelServeReconciler) deploymentForModelServe(m *modelv1alpha1.ModelServe) *appsv1.Deployment {
 	ls := labelsForModelServe(m.Name)
 	replicas := m.Spec.Replicas
@@ -131,16 +258,51 @@ func (r *ModelServeReconciler) deploymentForModelServe(m *modelv1alpha1.ModelSer
 		image = "ghcr.io/ggerganov/llama.cpp:server"
 	}
 
-	shareProcessNamespace := true
+	// Get MinIO configuration from spec or environment
+	minioEndpoint := m.Spec.MinIOEndpoint
+	if minioEndpoint == "" {
+		minioEndpoint = getEnvOrDefault("MINIO_ENDPOINT", "minio:9000")
+	}
+	
+	minioBucket := m.Spec.MinIOBucket
+	if minioBucket == "" {
+		minioBucket = getEnvOrDefault("MINIO_BUCKET", "inference-models")
+	}
 
-	// For dev mode, we mount the local path.
-	// In production, we would download from S3.
-	// Here we assume the node has the volume mounted at /home/Inference_service/Model_Catalog
+	minioPath := m.Spec.MinIOPath
+	if minioPath == "" {
+		minioPath = "models/" + m.Spec.ModelName
+	}
+
+	// Memory and CPU limits
+	memoryLimit := m.Spec.MemoryLimit
+	if memoryLimit == 0 {
+		memoryLimit = 4096 // 4GB default
+	}
+	cpuLimit := m.Spec.CPULimit
+	if cpuLimit == 0 {
+		cpuLimit = 2000 // 2 cores default
+	}
+
+	// Parse runtime params if provided
+	llamaArgs := []string{
+		"-m", "/models/" + m.Spec.ModelName,
+		"--host", "0.0.0.0",
+		"--port", "8080",
+	}
+	if m.Spec.RuntimeParams != "" {
+		// Parse additional params
+		extraArgs := strings.Fields(m.Spec.RuntimeParams)
+		llamaArgs = append(llamaArgs, extraArgs...)
+	}
+
+	shareProcessNamespace := true
 
 	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      m.Name,
 			Namespace: m.Namespace,
+			Labels:    ls,
 		},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: replicas,
@@ -150,18 +312,61 @@ func (r *ModelServeReconciler) deploymentForModelServe(m *modelv1alpha1.ModelSer
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: ls,
+					Annotations: map[string]string{
+						"model-uuid": m.Spec.ModelUUID,
+					},
 				},
 				Spec: corev1.PodSpec{
 					ShareProcessNamespace: &shareProcessNamespace,
+					// Init container to download model from MinIO
+					InitContainers: []corev1.Container{
+						{
+							Name:  "download-model",
+							Image: "minio/mc:latest",
+							Command: []string{"/bin/sh", "-c"},
+							Args: []string{
+								fmt.Sprintf(`
+set -e
+echo "Configuring MinIO client..."
+mc alias set minio http://%s $MINIO_ACCESS_KEY $MINIO_SECRET_KEY
+
+echo "Downloading model from MinIO..."
+mc cp minio/%s/%s /models/%s
+
+echo "Model downloaded successfully"
+ls -la /models/
+`, minioEndpoint, minioBucket, minioPath, m.Spec.ModelName),
+							},
+							Env: []corev1.EnvVar{
+								{
+									Name: "MINIO_ACCESS_KEY",
+									ValueFrom: &corev1.EnvVarSource{
+										SecretKeyRef: &corev1.SecretKeySelector{
+											LocalObjectReference: corev1.LocalObjectReference{Name: "inference-secrets"},
+											Key:                  "MINIO_ACCESS_KEY",
+										},
+									},
+								},
+								{
+									Name: "MINIO_SECRET_KEY",
+									ValueFrom: &corev1.EnvVarSource{
+										SecretKeyRef: &corev1.SecretKeySelector{
+											LocalObjectReference: corev1.LocalObjectReference{Name: "inference-secrets"},
+											Key:                  "MINIO_SECRET_KEY",
+										},
+									},
+								},
+							},
+							VolumeMounts: []corev1.VolumeMount{
+								{Name: "model-volume", MountPath: "/models"},
+							},
+						},
+					},
 					Containers: []corev1.Container{
 						{
 							Image: image,
 							Name:  "llama-server",
-							Args: []string{
-								"-m", "/models/" + m.Spec.ModelName, // Assuming model file is at /models/<ModelName>
-								"--host", "0.0.0.0",
-								"--port", "8080",
-							},
+							Args:  llamaArgs,
 							Ports: []corev1.ContainerPort{{
 								ContainerPort: 8080,
 								Name:          "http",
@@ -170,18 +375,68 @@ func (r *ModelServeReconciler) deploymentForModelServe(m *modelv1alpha1.ModelSer
 								Name:      "model-volume",
 								MountPath: "/models",
 							}},
+							Resources: corev1.ResourceRequirements{
+								Requests: corev1.ResourceList{
+									corev1.ResourceMemory: resource.MustParse(fmt.Sprintf("%dMi", memoryLimit/2)),
+									corev1.ResourceCPU:    resource.MustParse(fmt.Sprintf("%dm", cpuLimit/2)),
+								},
+								Limits: corev1.ResourceList{
+									corev1.ResourceMemory: resource.MustParse(fmt.Sprintf("%dMi", memoryLimit)),
+									corev1.ResourceCPU:    resource.MustParse(fmt.Sprintf("%dm", cpuLimit)),
+								},
+							},
+							ReadinessProbe: &corev1.Probe{
+								ProbeHandler: corev1.ProbeHandler{
+									HTTPGet: &corev1.HTTPGetAction{
+										Path: "/health",
+										Port: intstr.FromInt(8080),
+									},
+								},
+								InitialDelaySeconds: 30,
+								PeriodSeconds:       10,
+							},
+							LivenessProbe: &corev1.Probe{
+								ProbeHandler: corev1.ProbeHandler{
+									HTTPGet: &corev1.HTTPGetAction{
+										Path: "/health",
+										Port: intstr.FromInt(8080),
+									},
+								},
+								InitialDelaySeconds: 60,
+								PeriodSeconds:       30,
+							},
 						},
 						{
 							Name:    "monitor-sidecar",
 							Image:   "python:3.9-slim",
 							Command: []string{"/bin/sh", "-c"},
-							Args:    []string{"pip install psycopg2-binary psutil && python /scripts/monitor.py"},
+							Args:    []string{"pip install psycopg2-binary psutil requests && python /scripts/monitor.py"},
 							Env: []corev1.EnvVar{
 								{Name: "SERVER_UUID", Value: m.Name},
+								{Name: "MODEL_UUID", Value: m.Spec.ModelUUID},
 								{Name: "MODEL_NAME", Value: m.Spec.ModelName},
+								{
+									Name: "DATABASE_URL",
+									ValueFrom: &corev1.EnvVarSource{
+										ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+											LocalObjectReference: corev1.LocalObjectReference{Name: "inference-config"},
+											Key:                  "DATABASE_URL",
+										},
+									},
+								},
 							},
 							VolumeMounts: []corev1.VolumeMount{
 								{Name: "monitor-script", MountPath: "/scripts"},
+							},
+							Resources: corev1.ResourceRequirements{
+								Requests: corev1.ResourceList{
+									corev1.ResourceMemory: resource.MustParse("64Mi"),
+									corev1.ResourceCPU:    resource.MustParse("50m"),
+								},
+								Limits: corev1.ResourceList{
+									corev1.ResourceMemory: resource.MustParse("128Mi"),
+									corev1.ResourceCPU:    resource.MustParse("100m"),
+								},
 							},
 						},
 					},
@@ -189,8 +444,8 @@ func (r *ModelServeReconciler) deploymentForModelServe(m *modelv1alpha1.ModelSer
 						{
 							Name: "model-volume",
 							VolumeSource: corev1.VolumeSource{
-								HostPath: &corev1.HostPathVolumeSource{
-									Path: "/home/Inference_service/Model_Catalog", // Map to the node's path
+								EmptyDir: &corev1.EmptyDirVolumeSource{
+									SizeLimit: resource.NewQuantity(10*1024*1024*1024, resource.BinarySI), // 10GB
 								},
 							},
 						},
@@ -216,6 +471,7 @@ func (r *ModelServeReconciler) serviceForModelServe(m *modelv1alpha1.ModelServe)
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      m.Name,
 			Namespace: m.Namespace,
+			Labels:    ls,
 		},
 		Spec: corev1.ServiceSpec{
 			Selector: ls,
@@ -228,18 +484,23 @@ func (r *ModelServeReconciler) serviceForModelServe(m *modelv1alpha1.ModelServe)
 	}
 }
 
-// ingressForModelServe returns a modelServe Ingress object
+// ingressForModelServe returns a modelServe Ingress object with JWT auth middleware
 func (r *ModelServeReconciler) ingressForModelServe(m *modelv1alpha1.ModelServe) *networkingv1.Ingress {
 	ls := labelsForModelServe(m.Name)
 	pathType := networkingv1.PathTypePrefix
+
+	// Chain JWT auth middleware with strip prefix middleware
+	// Format: namespace-middlewarename@kubernetescrd
+	middlewares := fmt.Sprintf("%s-jwt-auth@kubernetescrd,%s-%s-stripprefix@kubernetescrd",
+		m.Namespace, m.Namespace, m.Name)
 
 	return &networkingv1.Ingress{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      m.Name,
 			Namespace: m.Namespace,
 			Annotations: map[string]string{
-				// Traefik middleware for stripping the path prefix
-				"traefik.ingress.kubernetes.io/router.middlewares": "default-" + m.Name + "-stripprefix@kubernetescrd",
+				// Traefik middleware chain: JWT auth first, then strip prefix
+				"traefik.ingress.kubernetes.io/router.middlewares": middlewares,
 			},
 			Labels: ls,
 		},

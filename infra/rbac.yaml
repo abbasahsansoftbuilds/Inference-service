@@ -1,0 +1,35 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: contract-service
+  namespace: default
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: contract-service-role
+rules:
+  - apiGroups: ["inference.zeroops.io"]
+    resources: ["modelserves"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods", "services"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: contract-service-rolebinding
+subjects:
+  - kind: ServiceAccount
+    name: contract-service
+    namespace: default
+roleRef:
+  kind: ClusterRole
+  name: contract-service-role
+  apiGroup: rbac.authorization.k8s.io

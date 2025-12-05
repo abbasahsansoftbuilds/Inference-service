@@ -18,7 +18,7 @@ import os
 import signal
 
 # Configuration
-BASE_URL = "http://localhost:8000"
+BASE_URL = os.getenv("FASTAPI_URL", "http://localhost:8200")
 HEADERS = {"Authorization": "Bearer test-token"}
 PID_DIR = "/tmp/inference_service_pf"
 

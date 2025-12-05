@@ -25,11 +25,22 @@ import (
 
 // ModelServeSpec defines the desired state of ModelServe
 type ModelServeSpec struct {
-	// ModelName is the name of the model to serve
+	// ModelName is the name of the model file (e.g., "Qwen.gguf")
 	ModelName string `json:"modelName"`
 
-	// ModelURL is the URL or local path to the model file
-	ModelURL string `json:"modelUrl"`
+	// ModelUUID is the unique identifier for the model in the database
+	ModelUUID string `json:"modelUuid"`
+
+	// MinIOPath is the path to the model in MinIO (e.g., "models/Qwen.gguf")
+	MinIOPath string `json:"minioPath"`
+
+	// MinIOEndpoint is the MinIO service endpoint (e.g., "minio:9000")
+	// +optional
+	MinIOEndpoint string `json:"minioEndpoint,omitempty"`
+
+	// MinIOBucket is the bucket name containing the model
+	// +optional
+	MinIOBucket string `json:"minioBucket,omitempty"`
 
 	// Image is the container image to use for serving (optional)
 	// +optional
@@ -38,16 +49,50 @@ type ModelServeSpec struct {
 	// Replicas is the number of replicas to run (optional, default 1)
 	// +optional
 	Replicas *int32 `json:"replicas,omitempty"`
+
+	// RuntimeParams are additional runtime parameters for llama.cpp
+	// +optional
+	RuntimeParams string `json:"runtimeParams,omitempty"`
+
+	// MemoryLimit is the maximum memory in MB for the container
+	// +optional
+	MemoryLimit int32 `json:"memoryLimit,omitempty"`
+
+	// CPULimit is the maximum CPU in millicores for the container
+	// +optional
+	CPULimit int32 `json:"cpuLimit,omitempty"`
 }
 
 // ModelServeStatus defines the observed state of ModelServe
 type ModelServeStatus struct {
 	// AvailableReplicas is the number of available replicas
 	AvailableReplicas int32 `json:"availableReplicas"`
+
+	// Phase is the current phase of the ModelServe (Pending, Downloading, Running, Failed)
+	Phase string `json:"phase,omitempty"`
+
+	// GatewayURL is the URL to access the model through the ingress
+	GatewayURL string `json:"gatewayUrl,omitempty"`
+
+	// ServiceName is the name of the Kubernetes service
+	ServiceName string `json:"serviceName,omitempty"`
+
+	// PodName is the name of the pod running the model
+	PodName string `json:"podName,omitempty"`
+
+	// StartedAt is when the model server started
+	StartedAt *metav1.Time `json:"startedAt,omitempty"`
+
+	// Message provides additional information about the current status
+	Message string `json:"message,omitempty"`
 }
 
 //+kubebuilder:object:root=true
 //+kubebuilder:subresource:status
+//+kubebuilder:printcolumn:name="Model",type=string,JSONPath=`.spec.modelName`
+//+kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
+//+kubebuilder:printcolumn:name="Replicas",type=integer,JSONPath=`.status.availableReplicas`
+//+kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // ModelServe is the Schema for the modelserves API
 type ModelServe struct {

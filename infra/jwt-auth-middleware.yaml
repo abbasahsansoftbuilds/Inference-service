@@ -1,0 +1,113 @@
+---
+# JWT Auth Service - validates JWT tokens for gateway requests
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jwt-auth-service
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: jwt-auth-service
+  template:
+    metadata:
+      labels:
+        app: jwt-auth-service
+    spec:
+      containers:
+        - name: jwt-auth
+          image: python:3.11-slim
+          ports:
+            - containerPort: 8080
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              pip install --quiet flask pyjwt gunicorn && 
+              mkdir -p /app &&
+              cat > /app/auth_server.py << 'EOF'
+              import os
+              import jwt
+              from flask import Flask, request, Response
+
+              app = Flask(__name__)
+
+              JWT_SECRET = os.environ.get("JWT_SECRET", "your-secret-key-change-in-production")
+              JWT_ALGORITHM = os.environ.get("JWT_ALGORITHM", "HS256")
+
+              @app.route("/auth", methods=["GET"])
+              def auth():
+                  """
+                  ForwardAuth endpoint.
+                  Returns 200 if valid, 401 if invalid.
+                  """
+                  auth_header = request.headers.get("Authorization")
+                  
+                  if not auth_header:
+                      return Response("Missing Authorization header", status=401)
+                  
+                  if not auth_header.startswith("Bearer "):
+                      return Response("Invalid Authorization format", status=401)
+                  
+                  token = auth_header[7:]
+                  
+                  try:
+                      payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+                      # Add user info to headers for downstream services
+                      response = Response("OK", status=200)
+                      response.headers["X-Auth-User"] = payload.get("sub", "anonymous")
+                      response.headers["X-Auth-Type"] = payload.get("type", "user")
+                      return response
+                  except jwt.ExpiredSignatureError:
+                      return Response("Token expired", status=401)
+                  except jwt.InvalidTokenError as e:
+                      return Response(f"Invalid token: {str(e)}", status=401)
+
+              @app.route("/health", methods=["GET"])
+              def health():
+                  return Response("OK", status=200)
+
+              if __name__ == "__main__":
+                  app.run(host="0.0.0.0", port=8080)
+              EOF
+              cd /app && gunicorn -b 0.0.0.0:8080 auth_server:app
+          env:
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: inference-secrets
+                  key: JWT_SECRET
+            - name: JWT_ALGORITHM
+              value: "HS256"
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "128Mi"
+              cpu: "100m"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 10
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jwt-auth-service
+  namespace: default
+spec:
+  selector:
+    app: jwt-auth-service
+  ports:
+    - port: 8080
+      targetPort: 8080

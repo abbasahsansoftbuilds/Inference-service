@@ -1,0 +1,401 @@
+================================================================================
+                    INFERENCE SERVICE - SESSION HANDOFF DOCUMENT
+                           Last Updated: December 5, 2025
+================================================================================
+
+## CURRENT STATUS: DISK PRESSURE BLOCKING DEPLOYMENT
+
+The implementation is COMPLETE but testing was blocked by disk space issues on
+the development machine (91% disk usage causing Kubernetes DiskPressure).
+
+User decided to test on another machine with more space.
+
+================================================================================
+                              WHAT WAS IMPLEMENTED
+================================================================================
+
+### ORIGINAL TASK:
+Implement the remaining 2 features from not_fulfilled.md:
+1. Operator Webhook Authentication (JWT validation for CRD operations)
+2. Gateway Ingress JWT Authentication
+
+Then run end-to-end setup to verify everything works.
+
+### FEATURES IMPLEMENTED THIS SESSION:
+
+1. **Operator Webhook with JWT Validation**
+   - File: `/operator/api/v1alpha1/modelserve_webhook.go`
+   - Implements ValidatingWebhook and MutatingWebhook
+   - Validates JWT tokens from annotation `model.example.com/auth-token`
+   - Checks token signature, expiry, and type (internal/user)
+   - Uses HS256 algorithm with JWT_SECRET from environment
+
+2. **Gateway JWT Auth Middleware Service**
+   - File: `/infra/jwt-auth-middleware.yaml`
+   - Flask-based ForwardAuth service for gateway JWT validation
+   - Endpoints: /auth (validates Bearer tokens), /health (health check)
+   - Returns 200 on valid token, 401 on invalid/missing token
+
+3. **Webhook Configuration Files**
+   - `/operator/config/webhook/kustomization.yaml`
+   - `/operator/config/webhook/service.yaml`
+   - `/operator/config/webhook/manifests.yaml`
+
+4. **Updated Operator Main**
+   - File: `/operator/cmd/main.go`
+   - Added webhook registration with ENABLE_WEBHOOKS env var toggle
+
+5. **Updated Controller for JWT Middleware**
+   - File: `/operator/internal/controller/modelserve_controller.go`
+   - Updated to use JWT middleware on ingress creation
+
+================================================================================
+                              CRITICAL BUG FIXES
+================================================================================
+
+1. **SQLAlchemy Reserved Keyword Error**
+   - File: `/shared/database.py`
+   - FIXED: Renamed `metadata` column to `model_metadata` in ModelRecord class
+   - The column name "metadata" is reserved in SQLAlchemy Declarative API
+   - Also updated `create_model_record()` function parameter name
+   - Line ~89: `model_metadata = Column(JSON, default={})`
+
+2. **Database Password Mismatch**
+   - File: `/infra/configmap.yaml`
+   - FIXED: DATABASE_URL password was "password" but secrets had "securepassword123"
+   - Changed to: `postgresql://admin:securepassword123@postgres:5432/inference_db`
+
+3. **Docker Build Context Too Large (4.4GB)**
+   - File: `/.dockerignore` (CREATED)
+   - Excludes: Model_Catalog/, tools/, .venv/, operator/, node_modules/, *.gguf
+   - Reduced build context from 4.4GB to ~45MB
+
+4. **Image Pull Policy for k3d**
+   - File: `/infra/services.yaml`
+   - Changed: `imagePullPolicy: IfNotPresent` -> `imagePullPolicy: Never`
+   - Required for locally built images in k3d cluster
+
+5. **JWT Auth Service Directory Issue**
+   - File: `/infra/jwt-auth-middleware.yaml`
+   - FIXED: Added `mkdir -p /app` before creating the Flask app file
+   - The container was failing because /app directory didn't exist
+
+================================================================================
+                         DOCKER IMAGES TO BUILD
+================================================================================
+
+All images build successfully. Commands to build:
+
+```bash
+cd /media/abbas/Optane1/Zero_ops/Inference_service
+
+# Build all service images
+docker build -t inference-fastapi:latest -f fastapi_service/Dockerfile .
+docker build -t inference-contract:latest -f contract_service/Dockerfile .
+docker build -t inference-download:latest -f download_service/Dockerfile .
+docker build -t inference-operator:latest -f operator/Dockerfile ./operator
+
+# Import into k3d cluster
+k3d image import inference-fastapi:latest inference-contract:latest \
+    inference-download:latest inference-operator:latest -c inference-cluster
+```
+
+================================================================================
+                         DEPLOYMENT ORDER & COMMANDS
+================================================================================
+
+### Step 1: Create k3d Cluster (without Traefik to save resources)
+```bash
+k3d cluster create inference-cluster --servers 1 \
+    --k3s-arg "--disable=traefik@server:0" --wait
+```
+
+### Step 2: Build and Import Images
+```bash
+cd /media/abbas/Optane1/Zero_ops/Inference_service
+docker build -t inference-fastapi:latest -f fastapi_service/Dockerfile .
+docker build -t inference-contract:latest -f contract_service/Dockerfile .
+docker build -t inference-download:latest -f download_service/Dockerfile .
+docker build -t inference-operator:latest -f operator/Dockerfile ./operator
+k3d image import inference-fastapi:latest inference-contract:latest \
+    inference-download:latest inference-operator:latest -c inference-cluster
+```
+
+### Step 3: Deploy Infrastructure
+```bash
+kubectl apply -f infra/secrets.yaml
+kubectl apply -f infra/configmap.yaml
+kubectl apply -f infra/postgres.yaml
+kubectl apply -f infra/minio.yaml
+# Wait for postgres and minio to be Running
+kubectl get pods -w
+```
+
+### Step 4: Deploy Services and CRD
+```bash
+kubectl apply -f infra/jwt-auth-middleware.yaml
+kubectl apply -f infra/rbac.yaml
+kubectl apply -f infra/services.yaml
+kubectl apply -f infra/modelserve-crd.yaml
+```
+
+### Step 5: Deploy Operator
+```bash
+kubectl apply -f - <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inference-operator
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: inference-operator
+  template:
+    metadata:
+      labels:
+        app: inference-operator
+    spec:
+      serviceAccountName: inference-operator
+      containers:
+      - name: manager
+        image: inference-operator:latest
+        imagePullPolicy: Never
+        env:
+        - name: WATCH_NAMESPACE
+          value: "default"
+        - name: ENABLE_WEBHOOKS
+          value: "false"
+        - name: DATABASE_URL
+          valueFrom:
+            configMapKeyRef:
+              name: inference-config
+              key: DATABASE_URL
+        - name: MINIO_ENDPOINT
+          valueFrom:
+            configMapKeyRef:
+              name: inference-config
+              key: MINIO_ENDPOINT
+        - name: MINIO_BUCKET
+          valueFrom:
+            configMapKeyRef:
+              name: inference-config
+              key: MINIO_BUCKET
+        resources:
+          limits:
+            cpu: 200m
+            memory: 256Mi
+EOF
+```
+
+### Step 6: Port Forward for Testing
+```bash
+kubectl port-forward svc/fastapi-service 8200:8200 &
+kubectl port-forward svc/contract-service 8201:8201 &
+kubectl port-forward svc/download-service 8202:8202 &
+```
+
+================================================================================
+                         TESTING ENDPOINTS
+================================================================================
+
+### Health Check
+```bash
+curl http://localhost:8200/health
+# Expected: {"status":"healthy","service":"fastapi-gateway"}
+```
+
+### Get Auth Token
+```bash
+curl -X POST http://localhost:8200/auth/token \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"admin-password"}'
+# Returns JWT access_token
+```
+
+### Test Protected Endpoints
+```bash
+TOKEN="<token_from_above>"
+curl http://localhost:8200/status -H "Authorization: Bearer $TOKEN"
+curl http://localhost:8200/models/available -H "Authorization: Bearer $TOKEN"
+```
+
+### Test Model Serving (if model is in MinIO)
+```bash
+curl "http://localhost:8200/serve?model=SmolLM2&replicas=1" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+================================================================================
+                    TESTING FROM INSIDE CLUSTER (No Port Forward)
+================================================================================
+
+```bash
+# Get token and test
+kubectl run -it --rm curl-test --image=curlimages/curl --restart=Never -- \
+  sh -c 'TOKEN=$(curl -s -X POST http://fastapi-service:8200/auth/token \
+    -H "Content-Type: application/json" \
+    -d '\''{"username":"admin","password":"admin-password"}'\'' | \
+    sed "s/.*access_token\":\"\\([^\"]*\\).*/\\1/"); \
+  curl -s http://fastapi-service:8200/status -H "Authorization: Bearer $TOKEN"'
+```
+
+================================================================================
+                         WHAT WAS VERIFIED WORKING
+================================================================================
+
+Before disk pressure hit, the following were verified:
+
+1. ✅ All Docker images build successfully
+2. ✅ PostgreSQL pod starts and accepts connections
+3. ✅ MinIO pod starts successfully
+4. ✅ JWT Auth Middleware pod runs (after fixing /app directory)
+5. ✅ FastAPI service starts and health endpoint returns 200
+6. ✅ Database tables are created on startup
+7. ✅ Authentication endpoint works and returns JWT tokens
+8. ✅ Status endpoint works with valid JWT token
+9. ✅ Models/available endpoint works with valid JWT token
+
+================================================================================
+                         DISK PRESSURE ISSUES ENCOUNTERED
+================================================================================
+
+The development machine has only 46GB disk with 91% usage.
+Kubernetes was evicting pods due to DiskPressure condition.
+
+### Cleanup Commands That Were Used
+```bash
+docker system prune -af --volumes
+rm -rf ~/.cache/go-build/*
+rm -rf ~/.cache/huggingface/*
+rm -rf ~/.cache/google-chrome/*
+rm -rf ~/.npm/_cacache/*
+```
+
+### k3d Cluster Disk Usage
+Each k3d cluster consumes disk for:
+- Container images (~500MB-1GB)
+- etcd data
+- Container overlays
+- Logs
+
+### Recommendation for New Machine
+- Minimum 20GB free disk space recommended
+- Or use a cloud-based Kubernetes cluster (GKE, EKS, etc.)
+
+================================================================================
+                         FRONTEND STATUS
+================================================================================
+
+Frontend is located in `/frontend/` directory:
+- React + Vite setup
+- Main component: `src/App.jsx`
+- NOT YET TESTED (blocked by disk pressure before getting to frontend)
+
+To run frontend:
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+================================================================================
+                         FILES MODIFIED THIS SESSION
+================================================================================
+
+### New Files Created:
+- /operator/api/v1alpha1/modelserve_webhook.go
+- /operator/config/webhook/kustomization.yaml
+- /operator/config/webhook/service.yaml
+- /operator/config/webhook/manifests.yaml
+- /infra/jwt-auth-middleware.yaml
+- /.dockerignore
+- /LEFT_OFF_HERE.txt (this file)
+
+### Files Modified:
+- /shared/database.py (metadata -> model_metadata)
+- /infra/configmap.yaml (fixed DATABASE_URL password)
+- /infra/services.yaml (imagePullPolicy: Never)
+- /operator/cmd/main.go (webhook registration)
+- /operator/internal/controller/modelserve_controller.go (JWT middleware)
+- /Makefile (added jwt-auth-middleware target)
+
+================================================================================
+                         REMAINING WORK / NEXT STEPS
+================================================================================
+
+1. **Deploy on machine with more disk space**
+   - Follow the deployment steps above
+   - All code is ready, just needs resources
+
+2. **Verify End-to-End Flow**
+   - Deploy a model using /serve endpoint
+   - Check that ModelServe CR is created
+   - Verify operator creates Deployment and Service
+   - Test model inference endpoint
+
+3. **Test Frontend**
+   - Start frontend with npm run dev
+   - Test UI interactions with backend
+
+4. **Optional: Enable Webhooks**
+   - Set ENABLE_WEBHOOKS=true in operator deployment
+   - Deploy webhook certificates (or use cert-manager)
+   - Test that webhook validates JWT on CR creation
+
+5. **Update not_fulfilled.md**
+   - Mark completed features as done
+
+================================================================================
+                         KNOWN ISSUES / GOTCHAS
+================================================================================
+
+1. **Traefik Not Available**
+   - Cluster is created with --disable=traefik
+   - IngressRoute CRDs don't exist
+   - Use NodePort or LoadBalancer services instead
+   - Or install Traefik separately if needed
+
+2. **Webhook Certificates**
+   - Webhooks require TLS certificates
+   - For dev, set ENABLE_WEBHOOKS=false
+   - For prod, use cert-manager
+
+3. **Model Catalog Files**
+   - Large .gguf files in Model_Catalog/ (~500MB each)
+   - Excluded from Docker builds via .dockerignore
+   - Need to upload to MinIO separately for serving
+
+4. **Database Schema**
+   - Tables are auto-created on first FastAPI startup
+   - If schema changes, drop tables and restart:
+     kubectl exec -it <postgres-pod> -- psql -U admin -d inference_db \
+       -c "DROP TABLE IF EXISTS server_records, model_records CASCADE;"
+
+================================================================================
+                         ENVIRONMENT VARIABLES REFERENCE
+================================================================================
+
+### From inference-secrets:
+- POSTGRES_USER: admin
+- POSTGRES_PASSWORD: securepassword123
+- MINIO_ACCESS_KEY: minioadmin
+- MINIO_SECRET_KEY: minioadmin123
+- JWT_SECRET: your-super-secret-jwt-key-change-in-production-minimum-32-chars
+- SERVICE_TOKEN_SECRET: service-to-service-secret-key-for-internal-comms
+
+### From inference-config:
+- DATABASE_URL: postgresql://admin:securepassword123@postgres:5432/inference_db
+- MINIO_ENDPOINT: minio:9000
+- MINIO_BUCKET: inference-models
+- JWT_ALGORITHM: HS256
+- JWT_EXPIRY_HOURS: 24
+
+### Default Credentials for Testing:
+- Admin User: admin / admin-password
+- Operator User: operator / operator-password
+
+================================================================================
+                              END OF HANDOFF
+================================================================================

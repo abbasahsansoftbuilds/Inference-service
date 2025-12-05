@@ -1,175 +1,346 @@
-from fastapi import FastAPI, HTTPException, Depends, Header
-from pydantic import BaseModel
-import os
-import requests
-import json
-from typing import Optional, List
-import psycopg2
+"""
+FastAPI Service - Main API Gateway for Inference Service
 
-app = FastAPI()
+Handles model serving requests, checks model availability in MinIO,
+and triggers download from Quant Service when needed.
+"""
+import os
+import sys
+import uuid as uuid_lib
+from typing import Optional, List
+from datetime import datetime
+from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import requests
+
+# Add shared directory to path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from shared.auth import verify_token, create_access_token
+from shared.minio_client import get_minio_client, file_exists, BUCKET_NAME
+from shared.database import (
+    get_db, init_db, 
+    ServerRecord, ModelRecord,
+    get_model_by_name, get_model_by_uuid,
+    create_server_record, update_server_status
+)
+
+app = FastAPI(
+    title="Inference Service API",
+    description="API Gateway for LLM Inference Service",
+    version="2.0.0"
+)
+
+# CORS configuration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Configuration
-MODEL_CATALOG_PATH = "/media/abbas/Optane/Inference_service/Model_Catalog"
-CONTRACT_SERVICE_URL = "http://localhost:8001/apply"
-CONTRACT_DELETE_URL = "http://localhost:8001/delete"
-POSTGRES_HOST = os.getenv("POSTGRES_HOST", "localhost")
-POSTGRES_PORT = os.getenv("POSTGRES_PORT", "5432")
-POSTGRES_USER = os.getenv("POSTGRES_USER", "admin")
-POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "password")
-POSTGRES_DB = os.getenv("POSTGRES_DB", "inference_db")
+CONTRACT_SERVICE_URL = os.getenv("CONTRACT_SERVICE_URL", "http://localhost:8201/apply")
+CONTRACT_DELETE_URL = os.getenv("CONTRACT_DELETE_URL", "http://localhost:8201/delete")
+CONTRACT_LIST_URL = os.getenv("CONTRACT_LIST_URL", "http://localhost:8201/list")
+DOWNLOAD_SERVICE_URL = os.getenv("DOWNLOAD_SERVICE_URL", "http://localhost:8202")
+GATEWAY_HOST = os.getenv("GATEWAY_HOST", "localhost:8080")
 
-class ServeRequest(BaseModel):
+
+class TokenRequest(BaseModel):
+    """Request for authentication token."""
+    username: str
+    password: str
+
+
+class TokenResponse(BaseModel):
+    """Authentication token response."""
+    access_token: str
+    token_type: str
+    expires_in: int
+
+
+class ServerStatusResponse(BaseModel):
+    """Server status response."""
+    uuid: str
+    model_uuid: Optional[str] = None
     model_name: str
+    status: str
+    memory_usage_mb: int = 0
+    memory_max_mb: int = 0
+    cpu_usage_percent: float = 0.0
+    endpoint: Optional[str] = None
+    gateway_url: Optional[str] = None
+    created_at: Optional[str] = None
+    started_at: Optional[str] = None
+    updated_at: Optional[str] = None
 
-class CRTemplate(BaseModel):
-    apiVersion: str = "model.example.com/v1alpha1"
-    kind: str = "ModelServe"
-    metadata: dict
-    spec: dict
 
-def verify_token(authorization: str = Header(...)):
-    if not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Invalid token format")
-    token = authorization.split(" ")[1]
-    # In a real app, verify the token signature here.
-    # For this implementation, we assume any token is valid if present.
-    return token
+@app.on_event("startup")
+async def startup():
+    """Initialize database on startup."""
+    init_db()
 
-@app.get("/serve")
-def serve_model(model: str, token: str = Depends(verify_token)):
-    # 2. Model Availability Check
-    model_path = os.path.join(MODEL_CATALOG_PATH, model)
-    # In dev, we check for directory or file. 
-    # The user said "model artifact (e.g., model.Q4.gguf) exists"
-    # Let's assume the model name maps to a file or directory.
-    
-    if not os.path.exists(model_path) and not os.path.exists(model_path + ".gguf"):
-         raise HTTPException(status_code=404, detail=f"Model {model} not found in catalog")
 
-    # 3. Fetch Signed URL (No-op in dev, use local path)
-    # We will use the local path for the CR
-    
-    # 4. Create Custom Resource (CR) Template
-    # Kubernetes names must be DNS-1035 compliant (lowercase alphanumeric, dash only)
-    cr_name = f"model-{model.lower().replace('_', '-').replace('.', '-')}"
-    
-    cr = {
-        "apiVersion": "model.example.com/v1alpha1",
-        "kind": "ModelServe",
-        "metadata": {
-            "name": cr_name,
-            "namespace": "default"
-        },
-        "spec": {
-            "modelName": model,
-            "modelUrl": model_path, # Local path in dev
-            "replicas": 1
-        }
+@app.get("/health")
+async def health():
+    """Health check endpoint."""
+    return {"status": "healthy", "service": "fastapi-gateway"}
+
+
+@app.post("/auth/token", response_model=TokenResponse)
+async def login(request: TokenRequest):
+    """
+    Authenticate user and return JWT token.
+    """
+    valid_users = {
+        "admin": os.getenv("ADMIN_PASSWORD", "admin-password"),
+        "operator": os.getenv("OPERATOR_PASSWORD", "operator-password")
     }
     
-    # 5. Contract Service / Controlled Apply
+    if request.username not in valid_users:
+        raise HTTPException(status_code=401, detail="Invalid username")
+    
+    if request.password != valid_users[request.username]:
+        raise HTTPException(status_code=401, detail="Invalid password")
+    
+    token = create_access_token(
+        subject=request.username,
+        additional_claims={"role": "admin" if request.username == "admin" else "operator"}
+    )
+    
+    return TokenResponse(
+        access_token=token,
+        token_type="bearer",
+        expires_in=24 * 3600
+    )
+
+@app.get("/serve")
+async def serve_model(
+    model: str,
+    replicas: int = 1,
+    token_payload: dict = Depends(verify_token)
+):
+    """
+    Request to deploy and serve a model.
+    
+    1. Check if model exists in local MinIO
+    2. If not, return info about triggering download from Quant Service
+    3. If yes, create CR and deploy
+    """
+    db = get_db()
+    
     try:
-        response = requests.post(CONTRACT_SERVICE_URL, json=cr, headers={"Authorization": f"Bearer {token}"})
-        response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=500, detail=f"Contract Service failed: {str(e)}")
+        # Clean model name (remove .gguf if present for lookup)
+        model_name = model.replace(".gguf", "")
         
-    return {"status": "success", "message": f"Model {model} deployment requested", "cr": cr}
+        # Check if model exists in local database (already downloaded)
+        model_record = get_model_by_name(db, model_name)
+        
+        if not model_record:
+            # Model not in local MinIO - need to download
+            return {
+                "status": "model_not_found",
+                "message": f"Model '{model_name}' not found in local storage. Use /download endpoint to fetch from Quant Service.",
+                "download_endpoint": f"{DOWNLOAD_SERVICE_URL}/download",
+                "next_steps": [
+                    "1. Call Quant Service to list available models",
+                    "2. Use /download endpoint with model_id to download",
+                    "3. Wait for download to complete",
+                    "4. Call /serve again"
+                ]
+            }
+        
+        if model_record.status != "ready":
+            return {
+                "status": "model_not_ready",
+                "message": f"Model '{model_name}' is being downloaded. Current status: {model_record.status}",
+                "model_uuid": model_record.uuid,
+                "check_status_endpoint": f"{DOWNLOAD_SERVICE_URL}/status/{model_record.uuid}"
+            }
+        
+        # Model is ready - create CR for deployment
+        # Generate server UUID
+        server_uuid = str(uuid_lib.uuid4())
+        
+        # Kubernetes-compliant name
+        cr_name = f"model-{model_name.lower().replace('_', '-').replace('.', '-')}-{server_uuid[:8]}"
+        
+        # Internal MinIO URL for the operator to use
+        minio_internal_url = f"minio:9000/{BUCKET_NAME}/{model_record.minio_path}"
+        
+        cr = {
+            "apiVersion": "model.example.com/v1alpha1",
+            "kind": "ModelServe",
+            "metadata": {
+                "name": cr_name,
+                "namespace": "default"
+            },
+            "spec": {
+                "modelName": f"{model_name}.gguf",
+                "modelUrl": minio_internal_url,
+                "modelUuid": model_record.uuid,
+                "replicas": replicas,
+                "serverUuid": server_uuid
+            }
+        }
+        
+        # Create server record in database
+        create_server_record(
+            db=db,
+            uuid=server_uuid,
+            model_uuid=model_record.uuid,
+            model_name=model_name,
+            runtime_params={"replicas": replicas},
+            namespace="default"
+        )
+        
+        # Forward token for contract service
+        internal_token = create_access_token(subject=token_payload.get("sub", "system"), token_type="internal")
+        
+        # Submit to Contract Service
+        try:
+            response = requests.post(
+                CONTRACT_SERVICE_URL,
+                json=cr,
+                headers={"Authorization": f"Bearer {internal_token}"},
+                timeout=30
+            )
+            response.raise_for_status()
+        except requests.RequestException as e:
+            raise HTTPException(status_code=500, detail=f"Contract Service failed: {str(e)}")
+        
+        # Gateway URL
+        gateway_url = f"https://{GATEWAY_HOST}/{server_uuid}/"
+        
+        # Update server record with gateway URL
+        update_server_status(db, server_uuid, "starting", gateway_url=gateway_url, endpoint=f"/{cr_name}")
+        
+        return {
+            "status": "success",
+            "message": f"Model {model_name} deployment requested",
+            "server_uuid": server_uuid,
+            "model_uuid": model_record.uuid,
+            "gateway_url": gateway_url,
+            "cr": cr
+        }
+        
+    finally:
+        db.close()
 
 @app.delete("/cleanup")
-def cleanup_model(model: str, token: str = Depends(verify_token)):
+async def cleanup_model(model: str, token_payload: dict = Depends(verify_token)):
     """
     Cleanup/delete a deployed model and all its associated resources.
-    This removes the ModelServe CR, which triggers the operator to delete
-    the Deployment and Service.
     """
-    # Construct the CR name from model name (same logic as serve)
-    cr_name = f"model-{model.lower().replace('_', '-').replace('.', '-')}"
+    model_name = model.replace(".gguf", "")
+    cr_name = f"model-{model_name.lower().replace('_', '-').replace('.', '-')}"
     
     delete_request = {
         "name": cr_name,
         "namespace": "default"
     }
     
+    internal_token = create_access_token(subject=token_payload.get("sub", "system"), token_type="internal")
+    
     try:
         response = requests.post(
-            CONTRACT_DELETE_URL, 
-            json=delete_request, 
-            headers={"Authorization": f"Bearer {token}"}
+            CONTRACT_DELETE_URL,
+            json=delete_request,
+            headers={"Authorization": f"Bearer {internal_token}"},
+            timeout=30
         )
         response.raise_for_status()
         result = response.json()
-    except requests.exceptions.RequestException as e:
+    except requests.RequestException as e:
         raise HTTPException(status_code=500, detail=f"Contract Service failed: {str(e)}")
     
     return {
-        "status": "success", 
-        "message": f"Model {model} cleanup completed",
-        "deleted_resource": cr_name
+        "status": "success",
+        "message": f"Model {model_name} cleanup completed",
+        "deleted_resource": cr_name,
+        "details": result
     }
 
 @app.get("/list")
-def list_models(token: str = Depends(verify_token)):
-    """
-    List all currently deployed models.
-    """
+async def list_models(token_payload: dict = Depends(verify_token)):
+    """List all currently deployed models."""
+    internal_token = create_access_token(subject=token_payload.get("sub", "system"), token_type="internal")
+    
     try:
         response = requests.get(
-            "http://localhost:8001/list",
-            headers={"Authorization": f"Bearer {token}"}
+            CONTRACT_LIST_URL,
+            headers={"Authorization": f"Bearer {internal_token}"},
+            timeout=30
         )
         response.raise_for_status()
         return response.json()
-    except requests.exceptions.RequestException as e:
+    except requests.RequestException as e:
         raise HTTPException(status_code=500, detail=f"Contract Service failed: {str(e)}")
 
-def get_db_connection():
-    """Get a connection to the PostgreSQL database."""
-    try:
-        conn = psycopg2.connect(
-            host=POSTGRES_HOST,
-            port=POSTGRES_PORT,
-            user=POSTGRES_USER,
-            password=POSTGRES_PASSWORD,
-            database=POSTGRES_DB
-        )
-        return conn
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database connection failed: {str(e)}")
-
-@app.get("/status")
-def get_server_status(token: str = Depends(verify_token)):
+@app.get("/status", response_model=List[ServerStatusResponse])
+async def get_server_status(token_payload: dict = Depends(verify_token)):
     """
     Get the status of all inference servers from the database.
-    Returns memory usage and status for each deployed model.
     """
-    conn = get_db_connection()
+    db = get_db()
+    
     try:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT uuid, model_name, status, memory_usage_mb, endpoint, updated_at 
-            FROM server_status 
-            ORDER BY updated_at DESC
-        """)
-        rows = cur.fetchall()
+        servers = db.query(ServerRecord).order_by(ServerRecord.updated_at.desc()).all()
         
-        servers = []
-        for row in rows:
-            servers.append({
-                "uuid": row[0],
-                "model_name": row[1],
-                "status": row[2],
-                "memory_usage_mb": row[3],
-                "endpoint": row[4],
-                "updated_at": row[5].isoformat() if row[5] else None
-            })
-        
-        return servers
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch server status: {str(e)}")
+        return [
+            ServerStatusResponse(
+                uuid=s.uuid,
+                model_uuid=s.model_uuid,
+                model_name=s.model_name,
+                status=s.status,
+                memory_usage_mb=s.memory_usage_mb or 0,
+                memory_max_mb=s.memory_max_mb or 0,
+                cpu_usage_percent=s.cpu_usage_percent or 0.0,
+                endpoint=s.endpoint,
+                gateway_url=s.gateway_url,
+                created_at=s.created_at.isoformat() if s.created_at else None,
+                started_at=s.started_at.isoformat() if s.started_at else None,
+                updated_at=s.updated_at.isoformat() if s.updated_at else None
+            )
+            for s in servers
+        ]
     finally:
-        conn.close()
+        db.close()
+
+
+@app.get("/models/available")
+async def list_available_models(token_payload: dict = Depends(verify_token)):
+    """
+    List all models available in local MinIO (downloaded from Quant Service).
+    """
+    db = get_db()
+    
+    try:
+        models = db.query(ModelRecord).filter(
+            ModelRecord.status == "ready"
+        ).order_by(ModelRecord.created_at.desc()).all()
+        
+        return {
+            "status": "success",
+            "models": [
+                {
+                    "uuid": m.uuid,
+                    "model_name": m.model_name,
+                    "quant_level": m.quant_level,
+                    "file_size_bytes": m.file_size_bytes,
+                    "minio_path": m.minio_path,
+                    "downloaded_at": m.downloaded_at.isoformat() if m.downloaded_at else None
+                }
+                for m in models
+            ]
+        }
+    finally:
+        db.close()
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.getenv("FASTAPI_PORT", "8200"))
+    uvicorn.run(app, host="0.0.0.0", port=port)

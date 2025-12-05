@@ -5,15 +5,51 @@ metadata:
   namespace: default
 data:
   init.sql: |
-    CREATE TABLE IF NOT EXISTS server_status (
+    -- Server records table (tracks running inference servers)
+    CREATE TABLE IF NOT EXISTS server_records (
+        uuid VARCHAR(255) PRIMARY KEY,
+        model_uuid VARCHAR(255) NOT NULL,
+        model_name VARCHAR(255) NOT NULL,
+        status VARCHAR(50) DEFAULT 'pending',
+        runtime_params TEXT,
+        memory_max_mb INT DEFAULT 0,
+        cpu_usage_percent FLOAT DEFAULT 0.0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        started_at TIMESTAMP,
+        pod_name VARCHAR(255),
+        service_name VARCHAR(255),
+        gateway_url VARCHAR(512)
+    );
+
+    -- Model records table (tracks models in MinIO)
+    CREATE TABLE IF NOT EXISTS model_records (
         uuid VARCHAR(255) PRIMARY KEY,
         model_name VARCHAR(255) NOT NULL,
-        status VARCHAR(50),
-        start_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        memory_usage_mb INT,
-        endpoint VARCHAR(255)
+        minio_path VARCHAR(512) NOT NULL,
+        external_source_id VARCHAR(255),
+        quant_level VARCHAR(50),
+        file_size_bytes BIGINT DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        downloaded_at TIMESTAMP
     );
+
+    -- Create indexes for common queries
+    CREATE INDEX IF NOT EXISTS idx_server_model_uuid ON server_records(model_uuid);
+    CREATE INDEX IF NOT EXISTS idx_server_status ON server_records(status);
+    CREATE INDEX IF NOT EXISTS idx_model_name ON model_records(model_name);
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-pvc
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
 
 ---
 apiVersion: apps/v1
@@ -36,20 +72,59 @@ spec:
         image: postgres:15
         env:
         - name: POSTGRES_USER
-          value: "admin"
+          valueFrom:
+            secretKeyRef:
+              name: inference-secrets
+              key: POSTGRES_USER
         - name: POSTGRES_PASSWORD
-          value: "password"
+          valueFrom:
+            secretKeyRef:
+              name: inference-secrets
+              key: POSTGRES_PASSWORD
         - name: POSTGRES_DB
-          value: "inference_db"
+          valueFrom:
+            configMapKeyRef:
+              name: inference-config
+              key: POSTGRES_DB
+        - name: PGDATA
+          value: /var/lib/postgresql/data/pgdata
         ports:
         - containerPort: 5432
         volumeMounts:
         - name: init-script
           mountPath: /docker-entrypoint-initdb.d
+        - name: postgres-storage
+          mountPath: /var/lib/postgresql/data
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          exec:
+            command:
+              - pg_isready
+              - -U
+              - admin
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          exec:
+            command:
+              - pg_isready
+              - -U
+              - admin
+          initialDelaySeconds: 5
+          periodSeconds: 5
       volumes:
       - name: init-script
         configMap:
           name: postgres-init
+      - name: postgres-storage
+        persistentVolumeClaim:
+          claimName: postgres-pvc
 
 ---
 apiVersion: v1
