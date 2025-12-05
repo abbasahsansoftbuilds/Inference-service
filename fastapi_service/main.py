@@ -168,22 +168,23 @@ async def serve_model(
         # Kubernetes-compliant name
         cr_name = f"model-{model_name.lower().replace('_', '-').replace('.', '-')}-{server_uuid[:8]}"
         
-        # Internal MinIO URL for the operator to use
-        minio_internal_url = f"minio:9000/{BUCKET_NAME}/{model_record.minio_path}"
-        
         cr = {
             "apiVersion": "model.example.com/v1alpha1",
             "kind": "ModelServe",
             "metadata": {
                 "name": cr_name,
-                "namespace": "default"
+                "namespace": "default",
+                "annotations": {
+                    "serverUuid": server_uuid
+                }
             },
             "spec": {
                 "modelName": f"{model_name}.gguf",
-                "modelUrl": minio_internal_url,
+                "minioPath": model_record.minio_path,
+                "minioBucket": BUCKET_NAME,
+                "minioEndpoint": "minio:9000",
                 "modelUuid": model_record.uuid,
-                "replicas": replicas,
-                "serverUuid": server_uuid
+                "replicas": replicas
             }
         }
         

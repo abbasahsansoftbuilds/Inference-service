@@ -11,13 +11,17 @@ data:
         model_uuid VARCHAR(255) NOT NULL,
         model_name VARCHAR(255) NOT NULL,
         status VARCHAR(50) DEFAULT 'pending',
-        runtime_params TEXT,
+        runtime_params JSON,
+        memory_usage_mb INT DEFAULT 0,
         memory_max_mb INT DEFAULT 0,
         cpu_usage_percent FLOAT DEFAULT 0.0,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        started_at TIMESTAMP,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        started_at TIMESTAMP WITH TIME ZONE,
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
         pod_name VARCHAR(255),
         service_name VARCHAR(255),
+        namespace VARCHAR(255) DEFAULT 'default',
+        endpoint VARCHAR(512),
         gateway_url VARCHAR(512)
     );
 
@@ -25,12 +29,16 @@ data:
     CREATE TABLE IF NOT EXISTS model_records (
         uuid VARCHAR(255) PRIMARY KEY,
         model_name VARCHAR(255) NOT NULL,
-        minio_path VARCHAR(512) NOT NULL,
-        external_source_id VARCHAR(255),
+        hf_name VARCHAR(255),
+        minio_path VARCHAR(512),
+        external_source_id INT,
         quant_level VARCHAR(50),
-        file_size_bytes BIGINT DEFAULT 0,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        downloaded_at TIMESTAMP
+        file_size_bytes BIGINT,
+        model_metadata JSON DEFAULT '{}',
+        status VARCHAR(50) DEFAULT 'downloading',
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        downloaded_at TIMESTAMP WITH TIME ZONE,
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
     );
 
     -- Create indexes for common queries

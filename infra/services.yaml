@@ -69,7 +69,11 @@ spec:
                   name: inference-config
                   key: JWT_EXPIRY_HOURS
             - name: CONTRACT_SERVICE_URL
-              value: "http://contract-service:8201"
+              value: "http://contract-service:8201/apply"
+            - name: CONTRACT_DELETE_URL
+              value: "http://contract-service:8201/delete"
+            - name: CONTRACT_LIST_URL
+              value: "http://contract-service:8201/list"
             - name: DOWNLOAD_SERVICE_URL
               value: "http://download-service:8202"
           resources:
@@ -270,6 +274,13 @@ spec:
                 configMapKeyRef:
                   name: inference-config
                   key: QUANT_MINIO_ENDPOINT
+            - name: QUANT_SERVICE_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: inference-secrets
+                  key: QUANT_SERVICE_SECRET
+            - name: QUANT_SERVICE_ID
+              value: "inference-service"
           resources:
             requests:
               memory: "512Mi"

@@ -1,0 +1,12 @@
+apiVersion: model.example.com/v1alpha1
+kind: ModelServe
+metadata:
+  name: test-model
+  namespace: default
+spec:
+  modelName: "test-llama"
+  modelUuid: "test-uuid-123"
+  minioPath: "models/test-llama.gguf"
+  replicas: 1
+  memoryLimit: 1024
+  cpuLimit: 1000

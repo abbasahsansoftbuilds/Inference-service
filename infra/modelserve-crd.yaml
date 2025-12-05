@@ -20,19 +20,50 @@ spec:
         properties:
           spec:
             type: object
+            required:
+              - modelName
+              - modelUuid
+              - minioPath
             properties:
               modelName:
                 type: string
-              modelUrl:
+                description: Name of the model file
+              modelUuid:
                 type: string
-              replicas:
-                type: integer
+                description: Unique identifier for the model
+              minioPath:
+                type: string
+                description: Path to the model in MinIO
+              minioEndpoint:
+                type: string
+                description: MinIO service endpoint
+              minioBucket:
+                type: string
+                description: MinIO bucket name
               image:
                 type: string
+                description: Container image for serving
+              replicas:
+                type: integer
+                description: Number of replicas
+                default: 1
+              runtimeParams:
+                type: string
+                description: Additional runtime parameters
+              memoryLimit:
+                type: integer
+                description: Maximum memory in MB
+              cpuLimit:
+                type: integer
+                description: Maximum CPU in millicores
           status:
             type: object
             properties:
               availableReplicas:
                 type: integer
+              phase:
+                type: string
+              message:
+                type: string
     subresources:
       status: {}

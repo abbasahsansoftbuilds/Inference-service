@@ -13,9 +13,9 @@ data:
   MINIO_BUCKET: "inference-models"
   MINIO_SECURE: "false"
   
-  # Quant Service Configuration (external cluster access)
-  QUANT_SERVICE_URL: "http://quant-api.llm.svc.cluster.local:8300"
-  QUANT_MINIO_ENDPOINT: "minio.llm.svc.cluster.local:9000"
+  # Quant Service Configuration (external cluster access via host)
+  QUANT_SERVICE_URL: "http://host.k3d.internal:30300"
+  QUANT_MINIO_ENDPOINT: "host.k3d.internal:30000"
   
   # Service Configuration
   FASTAPI_PORT: "8200"

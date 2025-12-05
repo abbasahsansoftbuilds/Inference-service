@@ -5,6 +5,7 @@ Validates Custom Resources, enforces resource contracts, and applies them to the
 """
 import os
 import sys
+import traceback
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -79,8 +80,8 @@ def validate_resource_contract(cr: dict) -> tuple[bool, str]:
     if not spec.get("modelName"):
         return False, "modelName is required in spec"
     
-    if not spec.get("modelUrl"):
-        return False, "modelUrl is required in spec"
+    if not spec.get("minioPath"):
+        return False, "minioPath is required in spec"
     
     return True, ""
 
@@ -142,7 +143,7 @@ async def apply_cr(cr: dict, authorization: str = Header(None)):
             # Create Traefik Middleware for path stripping
             try:
                 # Also create middleware for server UUID if present
-                server_uuid = cr.get("spec", {}).get("serverUuid")
+                server_uuid = cr.get("metadata", {}).get("annotations", {}).get("serverUuid")
                 prefixes = [f"/{name}"]
                 if server_uuid:
                     prefixes.append(f"/{server_uuid}")
@@ -166,6 +167,7 @@ async def apply_cr(cr: dict, authorization: str = Header(None)):
                 pass
             
     except Exception as e:
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to apply CR: {str(e)}")
     
     return {"status": "success", "message": f"Resource {action}", "name": name}

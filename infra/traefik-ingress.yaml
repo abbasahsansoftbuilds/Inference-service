@@ -1,0 +1,35 @@
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRoute
+metadata:
+  name: inference-gateway
+  namespace: default
+spec:
+  entryPoints:
+    - web
+  routes:
+    - match: Host(`inference.local`) && (Path(`/health`) || PathPrefix(`/auth/token`))
+      kind: Rule
+      services:
+        - name: fastapi-service
+          port: 8200
+      priority: 10
+    - match: Host(`inference.local`) && PathPrefix(`/`)
+      kind: Rule
+      services:
+        - name: fastapi-service
+          port: 8200
+      middlewares:
+        - name: jwt-auth
+      priority: 1
+---
+apiVersion: traefik.containo.us/v1alpha1
+kind: Middleware
+metadata:
+  name: jwt-auth
+  namespace: default
+spec:
+  forwardAuth:
+    address: http://jwt-auth-service:8080/auth
+    authResponseHeaders:
+      - X-Auth-User
+      - X-Auth-Type

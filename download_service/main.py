@@ -101,7 +101,8 @@ def download_model_from_quant_service(
     model_uuid: str,
     model_id: int,
     file_type: str,
-    model_name: str
+    model_name: str,
+    quant_level: Optional[str] = None
 ):
     """
     Background task to download a model from Quant Service.
@@ -116,17 +117,25 @@ def download_model_from_quant_service(
         headers = {"Authorization": f"Bearer {token}"}
         
         # Get download URL from Quant Service
-        download_info_url = f"{QUANT_SERVICE_URL}/models/{model_id}/download"
-        params = {"file_type": file_type, "expires_in": 7200}  # 2 hours
+        download_info_url = f"{QUANT_SERVICE_URL}/download-url/{model_id}"
+        params = {"expires_in": 7200}  # 2 hours
         
         response = requests.get(download_info_url, headers=headers, params=params, timeout=30)
         response.raise_for_status()
         download_info = response.json()
         
         presigned_url = download_info["download_url"]
+        
+        # Rewrite URL for cross-cluster access via host port-forward
+        # Quant Service generates URL with internal DNS (minio.llm.svc.cluster.local:9000)
+        # We need to access it via host.k3d.internal:9003 (which we port-forwarded)
+        if "minio.llm.svc.cluster.local" in presigned_url:
+            presigned_url = presigned_url.replace("minio.llm.svc.cluster.local", "host.k3d.internal")
+            presigned_url = presigned_url.replace(":9000", ":9003")
+            
         file_size = download_info.get("file_size_bytes")
-        quant_level = download_info.get("quant_level")
-        source_minio_path = download_info.get("minio_path")
+        # quant_level and minio_path are not returned by download-url endpoint
+        source_minio_path = None 
         
         # Create a temp file to download to
         with tempfile.NamedTemporaryFile(delete=False, suffix=".gguf") as tmp_file:
@@ -235,7 +244,7 @@ async def download_model(
             external_source_id=request.model_id,
             hf_name=hf_name,
             quant_level=quant_level,
-            metadata={
+            model_metadata={
                 "source": "quant-service",
                 "file_type": request.file_type,
                 "original_status": model_info.get("status")
@@ -248,7 +257,8 @@ async def download_model(
             model_uuid,
             request.model_id,
             request.file_type,
-            model_name
+            model_name,
+            quant_level
         )
         
         return DownloadResponse(
